@@ -1,4 +1,5 @@
-from flask import Flask, jsonify, request
+import os
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
@@ -7,11 +8,42 @@ from datetime import datetime, timedelta
 import requests
 from config import Config
 
-app = Flask(__name__)
-app.config.from_object(Config)
-CORS(app)
+# Paths to frontend
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIR = os.path.join(BASE_DIR, '..', 'frontend')
 
-# Helper functions
+# Serve frontend from Flask to avoid CORS
+app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='')
+app.config.from_object(Config)
+# You can scope CORS to API only
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# ---------- Frontend routes ----------
+@app.route("/")
+def index():
+    return send_from_directory(app.static_folder, "index.html")
+
+@app.route("/css/<path:filename>")
+def css(filename):
+    return send_from_directory(os.path.join(app.static_folder, "css"), filename)
+
+@app.route("/js/<path:filename>")
+def js(filename):
+    return send_from_directory(os.path.join(app.static_folder, "js"), filename)
+
+@app.route("/favicon.ico")
+def favicon():
+    path = os.path.join(app.static_folder, "favicon.ico")
+    if os.path.exists(path):
+        return send_from_directory(app.static_folder, "favicon.ico")
+    return ("", 204)
+
+# Optional health check
+@app.route("/api/health")
+def health():
+    return {"ok": True}
+
+# ---------- Helpers ----------
 def get_indian_stock_ticker(symbol, exchange='NSE'):
     """Convert symbol to Yahoo Finance format for Indian stocks"""
     if exchange == 'NSE':
@@ -82,7 +114,7 @@ def get_stock_recommendation(stock_data, user_profile):
     
     # Match with user profile
     risk_match = True
-    if user_profile['risk_tolerance'] == 'low' and risk_level == 'High':
+    if user_profile.get('risk_tolerance') == 'low' and risk_level == 'High':
         risk_match = False
         score -= 30
     
@@ -97,7 +129,7 @@ def get_stock_recommendation(stock_data, user_profile):
     
     return recommendation
 
-# API Routes
+# ---------- API ----------
 @app.route('/api/search/<symbol>')
 def search_stock(symbol):
     """Search for stock information"""
@@ -151,9 +183,9 @@ def search_stock(symbol):
 def get_recommendations():
     """Get stock recommendations based on user profile"""
     try:
-        user_profile = request.json
+        user_profile = request.json or {}
         budget = user_profile.get('budget', 100000)
-        risk_tolerance = user_profile.get('risk_tolerance', 'medium')
+        risk_tolerance = user_profile.get('risk_tolerance', 'medium')  # kept for compatibility
         
         # Popular Indian stocks for screening
         stocks_to_analyze = [
@@ -192,7 +224,7 @@ def get_recommendations():
                         'shares_affordable': int(budget / current_price)
                     })
             
-            except:
+            except Exception:
                 continue
         
         # Sort by score
@@ -205,10 +237,8 @@ def get_recommendations():
 
 @app.route('/api/news/<symbol>')
 def get_news(symbol):
-    """Get latest news for a stock"""
+    """Get latest news for a stock (mock data for now)"""
     try:
-        # Using a simple news search (you can integrate with actual news APIs)
-        # For demo purposes, returning mock data
         news = [
             {
                 'title': f'Latest updates on {symbol}',
@@ -223,11 +253,11 @@ def get_news(symbol):
                 'published': (datetime.now() - timedelta(days=1)).isoformat()
             }
         ]
-        
         return jsonify(news)
-    
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # Render provides PORT; bind to 0.0.0.0
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
