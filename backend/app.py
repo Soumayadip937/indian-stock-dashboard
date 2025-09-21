@@ -1,12 +1,17 @@
 import os
+import logging
+from datetime import datetime, timedelta
+
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 import requests
 from config import Config
+
+# Logging
+logging.basicConfig(level=logging.INFO)
 
 # Paths to frontend
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,8 +20,15 @@ FRONTEND_DIR = os.path.join(BASE_DIR, '..', 'frontend')
 # Serve frontend from Flask to avoid CORS
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='')
 app.config.from_object(Config)
-# You can scope CORS to API only
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# Persistent session with a real UA to reduce 403/empty responses from Yahoo
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9"
+})
 
 # ---------- Frontend routes ----------
 @app.route("/")
@@ -52,188 +64,268 @@ def get_indian_stock_ticker(symbol, exchange='NSE'):
         return f"{symbol}{Config.BSE_SUFFIX}"
     return symbol
 
-def calculate_technical_indicators(df):
+def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Calculate basic technical indicators"""
+    df = df.copy()
     # Simple Moving Averages
-    df['SMA_20'] = df['Close'].rolling(window=20).mean()
-    df['SMA_50'] = df['Close'].rolling(window=50).mean()
-    
-    # RSI
+    df['SMA_20'] = df['Close'].rolling(window=20, min_periods=1).mean()
+    df['SMA_50'] = df['Close'].rolling(window=50, min_periods=1).mean()
+
+    # RSI (simple version)
     delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
+    gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=1).mean()
+    rs = gain.replace(0, np.nan) / loss.replace(0, np.nan)
     df['RSI'] = 100 - (100 / (1 + rs))
-    
+
     # Bollinger Bands
-    df['BB_middle'] = df['Close'].rolling(window=20).mean()
-    bb_std = df['Close'].rolling(window=20).std()
+    df['BB_middle'] = df['Close'].rolling(window=20, min_periods=1).mean()
+    bb_std = df['Close'].rolling(window=20, min_periods=1).std()
     df['BB_upper'] = df['BB_middle'] + (bb_std * 2)
     df['BB_lower'] = df['BB_middle'] - (bb_std * 2)
-    
+
     return df
 
-def get_stock_recommendation(stock_data, user_profile):
+def get_stock_recommendation(stock_data: pd.DataFrame, user_profile):
     """Generate stock recommendations based on technical analysis and user profile"""
     latest = stock_data.iloc[-1]
-    
+
     score = 0
     reasons = []
-    
+
     # Price vs Moving Averages
     if latest['Close'] > latest['SMA_20']:
         score += 20
         reasons.append("Price above 20-day moving average (Bullish)")
-    
+
     if latest['Close'] > latest['SMA_50']:
         score += 15
         reasons.append("Price above 50-day moving average (Strong trend)")
-    
+
     # RSI Analysis
-    if 30 < latest['RSI'] < 70:
-        score += 20
-        reasons.append(f"RSI at {latest['RSI']:.2f} - Normal range")
-    elif latest['RSI'] <= 30:
-        score += 25
-        reasons.append(f"RSI at {latest['RSI']:.2f} - Oversold (Potential buy)")
-    
+    if pd.notna(latest.get('RSI')):
+        if 30 < latest['RSI'] < 70:
+            score += 20
+            reasons.append(f"RSI at {latest['RSI']:.2f} - Normal range")
+        elif latest['RSI'] <= 30:
+            score += 25
+            reasons.append(f"RSI at {latest['RSI']:.2f} - Oversold (Potential buy)")
+
     # Bollinger Bands
-    if latest['Close'] < latest['BB_lower']:
+    if pd.notna(latest.get('BB_lower')) and latest['Close'] < latest['BB_lower']:
         score += 20
         reasons.append("Price below lower Bollinger Band (Oversold)")
-    
-    # Volume analysis
-    avg_volume = stock_data['Volume'].rolling(window=20).mean().iloc[-1]
-    if latest['Volume'] > avg_volume * 1.5:
-        score += 15
-        reasons.append("High volume activity")
-    
+
+    # Volume analysis (best-effort)
+    if 'Volume' in stock_data.columns:
+        avg_volume = stock_data['Volume'].rolling(window=20, min_periods=1).mean().iloc[-1]
+        try:
+            if pd.notna(latest['Volume']) and pd.notna(avg_volume) and latest['Volume'] > avg_volume * 1.5:
+                score += 15
+                reasons.append("High volume activity")
+        except Exception:
+            pass
+
     # Risk assessment
     volatility = stock_data['Close'].pct_change().std() * np.sqrt(252) * 100
     risk_level = "Low" if volatility < 20 else "Medium" if volatility < 40 else "High"
-    
+
     # Match with user profile
     risk_match = True
-    if user_profile.get('risk_tolerance') == 'low' and risk_level == 'High':
+    if (user_profile or {}).get('risk_tolerance') == 'low' and risk_level == 'High':
         risk_match = False
         score -= 30
-    
+
     recommendation = {
-        'score': score,
+        'score': int(score),
         'rating': 'Strong Buy' if score >= 70 else 'Buy' if score >= 50 else 'Hold' if score >= 30 else 'Sell',
         'reasons': reasons,
         'risk_level': risk_level,
-        'volatility': volatility,
+        'volatility': float(volatility) if pd.notna(volatility) else 0.0,
         'risk_match': risk_match
     }
-    
+
     return recommendation
+
+def safe_float(x, default=0.0):
+    try:
+        f = float(x)
+        if np.isnan(f) or np.isinf(f):
+            return default
+        return f
+    except Exception:
+        return default
+
+def fetch_stock_data(ticker_symbol: str):
+    """Return (fast_info dict, history DataFrame) for a Yahoo ticker with fallbacks."""
+    t = yf.Ticker(ticker_symbol, session=session)
+
+    # fast_info (best-effort)
+    try:
+        finfo = t.fast_info or {}
+    except Exception as e:
+        app.logger.warning("fast_info failed for %s: %s", ticker_symbol, e)
+        finfo = {}
+
+    # primary history
+    hist = pd.DataFrame()
+    try:
+        hist = t.history(period="6mo", interval="1d", auto_adjust=False, actions=False)
+    except Exception as e:
+        app.logger.warning("history() failed for %s: %s", ticker_symbol, e)
+
+    # fallback to yf.download if history is empty
+    if hist is None or hist.empty:
+        try:
+            dl = yf.download(
+                tickers=ticker_symbol,
+                period="6mo",
+                interval="1d",
+                auto_adjust=False,
+                progress=False
+            )
+            if isinstance(dl, pd.DataFrame):
+                # If multi-index columns (rare for single ticker), flatten
+                if isinstance(dl.columns, pd.MultiIndex):
+                    dl.columns = [c[-1] for c in dl.columns]
+                hist = dl
+        except Exception as e:
+            app.logger.warning("yf.download failed for %s: %s", ticker_symbol, e)
+
+    return finfo, hist if isinstance(hist, pd.DataFrame) else pd.DataFrame()
 
 # ---------- API ----------
 @app.route('/api/search/<symbol>')
 def search_stock(symbol):
-    """Search for stock information"""
+    """Search for stock information without using .info (more reliable on servers)"""
     try:
-        # Try NSE first, then BSE
-        ticker_nse = get_indian_stock_ticker(symbol, 'NSE')
-        stock = yf.Ticker(ticker_nse)
-        info = stock.info
-        
-        if not info.get('regularMarketPrice'):
-            ticker_bse = get_indian_stock_ticker(symbol, 'BSE')
-            stock = yf.Ticker(ticker_bse)
-            info = stock.info
-        
-        # Get historical data
-        hist = stock.history(period="3mo")
-        
-        if hist.empty:
-            return jsonify({'error': 'Stock not found'}), 404
-        
-        # Calculate technical indicators
+        sym = (symbol or "").upper().strip()
+        # Try NSE, then BSE
+        exchange_used = "NSE"
+        ticker = get_indian_stock_ticker(sym, 'NSE')
+        finfo, hist = fetch_stock_data(ticker)
+
+        if hist is None or hist.empty:
+            exchange_used = "BSE"
+            ticker = get_indian_stock_ticker(sym, 'BSE')
+            finfo, hist = fetch_stock_data(ticker)
+
+        if hist is None or hist.empty:
+            return jsonify({'error': 'Stock not found or no data available'}), 404
+
+        # Indicators
         hist = calculate_technical_indicators(hist)
-        
-        # Prepare response
-        current_price = info.get('regularMarketPrice', hist['Close'].iloc[-1])
-        prev_close = info.get('previousClose', hist['Close'].iloc[-2])
-        change = current_price - prev_close
-        change_percent = (change / prev_close) * 100
-        
+
+        # Prices (robust)
+        last_close = safe_float(hist['Close'].iloc[-1], 0.0)
+        prev_close_hist = safe_float(hist['Close'].iloc[-2], last_close) if len(hist) > 1 else last_close
+        current_price = safe_float(finfo.get('last_price'), last_close)
+        previous_close = safe_float(
+            finfo.get('previous_close') or finfo.get('regularMarketPreviousClose'),
+            prev_close_hist
+        )
+        change = current_price - previous_close
+        change_percent = (change / previous_close * 100.0) if previous_close else 0.0
+
+        # Volume and misc
+        vol = finfo.get('last_volume')
+        if vol is None:
+            vol = int(hist['Volume'].iloc[-1]) if 'Volume' in hist.columns and pd.notna(hist['Volume'].iloc[-1]) else 0
+
+        week_52_high = safe_float(finfo.get('year_high'), safe_float(hist['High'].max(), last_close))
+        week_52_low = safe_float(finfo.get('year_low'), safe_float(hist['Low'].min(), last_close))
+        market_cap = int(finfo.get('market_cap') or 0)
+        pe_ratio = safe_float(finfo.get('trailing_pe'), 0.0)
+
+        # Last 60 rows with Date column
+        hist_tail = hist.tail(60).reset_index()
+        if 'Date' not in hist_tail.columns:
+            idx_name = hist_tail.columns[0]
+            hist_tail = hist_tail.rename(columns={idx_name: 'Date'})
+        if pd.api.types.is_datetime64_any_dtype(hist_tail['Date']):
+            hist_tail['Date'] = hist_tail['Date'].dt.strftime('%Y-%m-%d')
+        else:
+            hist_tail['Date'] = hist_tail['Date'].astype(str)
+
         response = {
-            'symbol': symbol,
-            'name': info.get('longName', symbol),
+            'symbol': sym,
+            'exchange': exchange_used,
+            'name': sym,  # avoid .info; frontend already falls back to symbol
             'current_price': current_price,
-            'previous_close': prev_close,
+            'previous_close': previous_close,
             'change': change,
             'change_percent': change_percent,
-            'volume': int(hist['Volume'].iloc[-1]),
-            'market_cap': info.get('marketCap', 0),
-            'pe_ratio': info.get('trailingPE', 0),
-            'week_52_high': info.get('fiftyTwoWeekHigh', 0),
-            'week_52_low': info.get('fiftyTwoWeekLow', 0),
-            'historical_data': hist[['Open', 'High', 'Low', 'Close', 'Volume']].tail(60).to_dict('records')
+            'volume': int(vol),
+            'market_cap': market_cap,
+            'pe_ratio': pe_ratio,
+            'week_52_high': week_52_high,
+            'week_52_low': week_52_low,
+            'historical_data': hist_tail[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].to_dict('records')
         }
-        
+
         return jsonify(response)
-    
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception("search_stock failed for %s", symbol)
+        return jsonify({'error': f'{type(e).__name__}: {e}'}), 500
 
 @app.route('/api/recommendations', methods=['POST'])
 def get_recommendations():
-    """Get stock recommendations based on user profile"""
+    """Get stock recommendations based on user profile without using .info"""
     try:
         user_profile = request.json or {}
         budget = user_profile.get('budget', 100000)
-        risk_tolerance = user_profile.get('risk_tolerance', 'medium')  # kept for compatibility
-        
+
         # Popular Indian stocks for screening
         stocks_to_analyze = [
             'RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'HINDUNILVR',
             'ITC', 'SBIN', 'BHARTIARTL', 'KOTAKBANK', 'LT',
             'HCLTECH', 'AXISBANK', 'ASIANPAINT', 'MARUTI', 'TITAN'
         ]
-        
+
         recommendations = []
-        
-        for symbol in stocks_to_analyze:
+
+        for sym in stocks_to_analyze:
             try:
-                ticker = get_indian_stock_ticker(symbol, 'NSE')
-                stock = yf.Ticker(ticker)
-                hist = stock.history(period="3mo")
-                
-                if hist.empty:
-                    continue
-                
+                # Try NSE then BSE
+                ticker = get_indian_stock_ticker(sym, 'NSE')
+                finfo, hist = fetch_stock_data(ticker)
+                if hist is None or hist.empty:
+                    ticker = get_indian_stock_ticker(sym, 'BSE')
+                    finfo, hist = fetch_stock_data(ticker)
+                    if hist is None or hist.empty:
+                        continue
+
                 hist = calculate_technical_indicators(hist)
-                info = stock.info
-                current_price = info.get('regularMarketPrice', hist['Close'].iloc[-1])
-                
+                current_price = safe_float(finfo.get('last_price'), safe_float(hist['Close'].iloc[-1], 0.0))
+
                 # Skip if price is above budget
-                if current_price > budget:
+                if current_price <= 0 or current_price > budget:
                     continue
-                
+
                 recommendation = get_stock_recommendation(hist, user_profile)
-                
+
                 if recommendation['score'] >= 40:  # Only include promising stocks
                     recommendations.append({
-                        'symbol': symbol,
-                        'name': info.get('longName', symbol),
+                        'symbol': sym,
+                        'name': sym,
                         'current_price': current_price,
                         'recommendation': recommendation,
                         'shares_affordable': int(budget / current_price)
                     })
-            
-            except Exception:
+
+            except Exception as inner_e:
+                app.logger.warning("Screening %s failed: %s", sym, inner_e)
                 continue
-        
+
         # Sort by score
         recommendations.sort(key=lambda x: x['recommendation']['score'], reverse=True)
-        
+
         return jsonify(recommendations[:10])  # Return top 10
-    
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception("recommendations failed")
+        return jsonify({'error': f'{type(e).__name__}: {e}'}), 500
 
 @app.route('/api/news/<symbol>')
 def get_news(symbol):
