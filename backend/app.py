@@ -1,18 +1,23 @@
 import os
 import logging
 from datetime import datetime, timedelta
-from json import JSONDecodeError
+from time import time
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+# yfinance is kept installed only as a fallback if you remove Twelve Data later
+# import yfinance as yf
 from config import Config
 
 # Logging
 logging.basicConfig(level=logging.INFO)
+
+# Twelve Data key (free). Set in Render env: TWELVEDATA_API_KEY
+TD_KEY = os.environ.get("TWELVEDATA_API_KEY")
+TD_BASE = "https://api.twelvedata.com"
 
 # Paths to frontend
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,15 +28,13 @@ app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='')
 app.config.from_object(Config)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# Persistent session with a real UA to reduce 403/empty responses from Yahoo
+# Shared session
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Connection": "keep-alive",
-    "Pragma": "no-cache",
-    "Cache-Control": "no-cache"
 })
 
 # ---------- Frontend routes ----------
@@ -60,13 +63,22 @@ def health():
     return {"ok": True}
 
 # ---------- Helpers ----------
+def normalize_symbol(sym: str) -> str:
+    # Fix common typos (RELIENCE -> RELIANCE)
+    fixes = {"RELIENCE": "RELIANCE"}
+    return fixes.get(sym, sym)
+
 def get_indian_stock_ticker(symbol, exchange='NSE'):
-    """Convert symbol to Yahoo Finance format for Indian stocks"""
+    """Yahoo suffixes (kept for reference/fallback), not used with Twelve Data"""
     if exchange == 'NSE':
         return f"{symbol}{Config.NSE_SUFFIX}"
     elif exchange == 'BSE':
         return f"{symbol}{Config.BSE_SUFFIX}"
     return symbol
+
+def td_symbol(symbol: str, exchange: str) -> str:
+    # Twelve Data uses "SYMBOL:NSE" / "SYMBOL:BSE"
+    return f"{symbol}:{exchange}"
 
 def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Calculate basic technical indicators"""
@@ -75,7 +87,7 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['SMA_20'] = df['Close'].rolling(window=20, min_periods=1).mean()
     df['SMA_50'] = df['Close'].rolling(window=50, min_periods=1).mean()
 
-    # RSI (simple version)
+    # RSI (simple)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=1).mean()
@@ -160,142 +172,84 @@ def safe_float(x, default=0.0):
     except Exception:
         return default
 
-def build_df_from_chart_json(j: dict) -> tuple[dict, pd.DataFrame]:
-    """Parse Yahoo chart JSON to (meta-like info dict, DataFrame)."""
-    try:
-        chart = j.get('chart', {})
-        if chart.get('error'):
-            return {}, pd.DataFrame()
-        results = chart.get('result')
-        if not results:
-            return {}, pd.DataFrame()
-        r0 = results[0]
-        ts = r0.get('timestamp', []) or []
-        ind = r0.get('indicators', {}).get('quote', [{}])[0]
-        opens = ind.get('open', [])
-        highs = ind.get('high', [])
-        lows = ind.get('low', [])
-        closes = ind.get('close', [])
-        vols = ind.get('volume', [])
+# Simple in-memory cache to reduce API hits (TTL seconds)
+CACHE = {}
+CACHE_TTL = 90  # seconds
 
-        if not ts or not closes:
-            return {}, pd.DataFrame()
+def cache_get(key):
+    item = CACHE.get(key)
+    if not item:
+        return None
+    if time() - item['ts'] > CACHE_TTL:
+        CACHE.pop(key, None)
+        return None
+    return item['val']
 
-        # Build DataFrame
-        dt_idx = pd.to_datetime(ts, unit='s', utc=True).tz_convert(r0.get('meta', {}).get('exchangeTimezoneName', 'UTC'), nonexistent='shift_forward', ambiguous='NaT')
-        df = pd.DataFrame({
-            'Open': pd.Series(opens, index=dt_idx, dtype='float64'),
-            'High': pd.Series(highs, index=dt_idx, dtype='float64'),
-            'Low': pd.Series(lows, index=dt_idx, dtype='float64'),
-            'Close': pd.Series(closes, index=dt_idx, dtype='float64'),
-            'Volume': pd.Series(vols, index=dt_idx, dtype='float64')
-        }).sort_index()
+def cache_set(key, val):
+    CACHE[key] = {'ts': time(), 'val': val}
 
-        # Clean NaNs if any entire rows are None
-        df = df.dropna(how='all')
+def td_fetch_series(symbol: str, exchange: str):
+    """Fetch up to 365 days of daily candles from Twelve Data for SYMBOL:EXCHANGE."""
+    if not TD_KEY:
+        return None  # key not set; caller will handle
+    symbol_ex = td_symbol(symbol, exchange)
+    cache_key = f"td:{symbol_ex}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
 
-        meta = r0.get('meta', {}) or {}
-        last_price = meta.get('regularMarketPrice') or (df['Close'].iloc[-1] if not df.empty else None)
-        previous_close = meta.get('previousClose') or (df['Close'].iloc[-2] if len(df) > 1 else last_price)
-
-        finfo_like = {
-            'last_price': safe_float(last_price, 0.0),
-            'previous_close': safe_float(previous_close, 0.0),
-            'year_high': safe_float(df['High'].max() if not df.empty else 0.0, 0.0),
-            'year_low': safe_float(df['Low'].min() if not df.empty else 0.0, 0.0),
-            'market_cap': 0,
-            'trailing_pe': 0,
-            'last_volume': int(df['Volume'].iloc[-1]) if 'Volume' in df.columns and not df.empty and pd.notna(df['Volume'].iloc[-1]) else 0
-        }
-        return finfo_like, df
-    except Exception:
-        return {}, pd.DataFrame()
-
-def fetch_via_yahoo_chart(ticker_symbol: str) -> tuple[dict, pd.DataFrame]:
-    """Direct call to Yahoo chart API with UA + Referer. Returns (info, DataFrame)."""
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=6mo&interval=1d&includePrePost=false&events=div%2Csplits&corsDomain=finance.yahoo.com"
-    headers = {
-        "Referer": f"https://finance.yahoo.com/quote/{ticker_symbol}",
-        "Accept": "application/json, text/plain, */*",
-        "User-Agent": session.headers.get("User-Agent", "")
+    params = {
+        "symbol": symbol_ex,
+        "interval": "1day",
+        "outputsize": "365",
+        "apikey": TD_KEY,
+        "timezone": "Asia/Kolkata",
+        "order": "ASC"  # oldest -> newest
     }
     try:
-        r = session.get(url, headers=headers, timeout=12)
-        if r.status_code != 200:
-            app.logger.warning("chart API %s status=%s", ticker_symbol, r.status_code)
-            return {}, pd.DataFrame()
-        try:
-            j = r.json()
-        except JSONDecodeError:
-            # Not JSON (blocked/HTML)
-            app.logger.warning("chart API JSON decode failed for %s", ticker_symbol)
-            return {}, pd.DataFrame()
-        return build_df_from_chart_json(j)
+        r = session.get(f"{TD_BASE}/time_series", params=params, timeout=12)
+        j = r.json()
     except Exception as e:
-        app.logger.warning("chart API request failed for %s: %s", ticker_symbol, e)
-        return {}, pd.DataFrame()
+        app.logger.warning("TwelveData request failed for %s: %s", symbol_ex, e)
+        return None
 
-def fetch_stock_data(ticker_symbol: str):
-    """Return (info dict, history DataFrame) with multiple fallbacks."""
-    # 1) yfinance fast_info + history
-    t = yf.Ticker(ticker_symbol, session=session)
-    finfo = {}
-    hist = pd.DataFrame()
+    if not isinstance(j, dict) or j.get("status") != "ok" or "values" not in j:
+        # Example error: {'code': 429, 'message': 'API rate limit exceeded'}
+        app.logger.warning("TwelveData error for %s: %s", symbol_ex, j)
+        return None
 
-    try:
-        finfo = t.fast_info or {}
-    except Exception as e:
-        app.logger.warning("fast_info failed %s: %s", ticker_symbol, e)
+    vals = j["values"]
+    if not vals:
+        return None
 
-    try:
-        hist = t.history(period="6mo", interval="1d", auto_adjust=False, actions=False)
-    except Exception as e:
-        app.logger.warning("history() failed %s: %s", ticker_symbol, e)
+    df = pd.DataFrame(vals)
+    # Expected columns: datetime, open, high, low, close, volume
+    # Ensure numeric types and ascending order
+    df["Date"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.rename(columns={
+        "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"
+    })
+    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]].sort_values("Date").reset_index(drop=True)
 
-    # 2) If history empty, try Yahoo chart API directly
-    if hist is None or hist.empty:
-        finfo_chart, hist_chart = fetch_via_yahoo_chart(ticker_symbol)
-        if not (hist_chart is None or hist_chart.empty):
-            # Merge finfo if fast_info is empty/partial
-            merged = dict(finfo_chart)
-            merged.update({k: v for k, v in finfo.items() if v is not None})
-            return merged, hist_chart
-
-    # 3) If still empty, try yf.download as a last resort
-    if hist is None or hist.empty:
-        try:
-            dl = yf.download(
-                tickers=ticker_symbol,
-                period="6mo",
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                session=session
-            )
-            if isinstance(dl, pd.DataFrame) and not dl.empty:
-                if isinstance(dl.columns, pd.MultiIndex):
-                    dl.columns = [c[-1] for c in dl.columns]
-                hist = dl
-        except Exception as e:
-            app.logger.warning("yf.download failed %s: %s", ticker_symbol, e)
-
-    return finfo or {}, hist if isinstance(hist, pd.DataFrame) else pd.DataFrame()
+    cache_set(cache_key, df)
+    return df
 
 # ---------- API ----------
 @app.route('/api/search/<symbol>')
 def search_stock(symbol):
-    """Search for stock information with robust Yahoo fallbacks"""
+    """Search for stock information via Twelve Data (free key required)."""
     try:
-        sym = (symbol or "").upper().strip()
-        # Try NSE, then BSE
-        exchange_used = "NSE"
-        ticker = get_indian_stock_ticker(sym, 'NSE')
-        finfo, hist = fetch_stock_data(ticker)
+        sym = normalize_symbol((symbol or "").upper().strip())
 
+        # Try NSE then BSE via Twelve Data
+        exchange_used = "NSE"
+        hist = td_fetch_series(sym, "NSE")
         if hist is None or hist.empty:
             exchange_used = "BSE"
-            ticker = get_indian_stock_ticker(sym, 'BSE')
-            finfo, hist = fetch_stock_data(ticker)
+            hist = td_fetch_series(sym, "BSE")
 
         if hist is None or hist.empty:
             return jsonify({'error': 'Stock not found or no data available'}), 404
@@ -303,48 +257,34 @@ def search_stock(symbol):
         # Indicators
         hist = calculate_technical_indicators(hist)
 
-        # Prices (robust)
+        # Prices
         last_close = safe_float(hist['Close'].iloc[-1], 0.0)
-        prev_close_hist = safe_float(hist['Close'].iloc[-2], last_close) if len(hist) > 1 else last_close
-        current_price = safe_float(finfo.get('last_price'), last_close)
-        previous_close = safe_float(
-            finfo.get('previous_close') or finfo.get('regularMarketPreviousClose'),
-            prev_close_hist
-        )
+        prev_close = safe_float(hist['Close'].iloc[-2], last_close) if len(hist) > 1 else last_close
+        current_price = last_close  # EOD data from TD
+        previous_close = prev_close
         change = current_price - previous_close
         change_percent = (change / previous_close * 100.0) if previous_close else 0.0
 
-        # Volume and misc
-        vol = finfo.get('last_volume')
-        if vol is None:
-            vol = int(hist['Volume'].iloc[-1]) if 'Volume' in hist.columns and pd.notna(hist['Volume'].iloc[-1]) else 0
+        # Volume, 52-week highs/lows from available history (approx)
+        vol = int(hist['Volume'].iloc[-1]) if 'Volume' in hist.columns and pd.notna(hist['Volume'].iloc[-1]) else 0
+        week_52_high = safe_float(hist['High'].tail(252).max() if len(hist) >= 2 else hist['High'].max(), last_close)
+        week_52_low = safe_float(hist['Low'].tail(252).min() if len(hist) >= 2 else hist['Low'].min(), last_close)
 
-        week_52_high = safe_float(finfo.get('year_high'), safe_float(hist['High'].max(), last_close))
-        week_52_low = safe_float(finfo.get('year_low'), safe_float(hist['Low'].min(), last_close))
-        market_cap = int(finfo.get('market_cap') or 0)
-        pe_ratio = safe_float(finfo.get('trailing_pe'), 0.0)
-
-        # Last 60 rows with Date column
-        hist_tail = hist.tail(60).reset_index()
-        if 'Date' not in hist_tail.columns:
-            idx_name = hist_tail.columns[0]
-            hist_tail = hist_tail.rename(columns={idx_name: 'Date'})
-        if pd.api.types.is_datetime64_any_dtype(hist_tail['Date']):
-            hist_tail['Date'] = hist_tail['Date'].dt.strftime('%Y-%m-%d')
-        else:
-            hist_tail['Date'] = hist_tail['Date'].astype(str)
+        # Prepare last 60 rows with Date string
+        hist_tail = hist.tail(60).copy()
+        hist_tail['Date'] = pd.to_datetime(hist_tail['Date']).dt.strftime('%Y-%m-%d')
 
         response = {
             'symbol': sym,
             'exchange': exchange_used,
-            'name': sym,  # avoid .info
+            'name': sym,
             'current_price': current_price,
             'previous_close': previous_close,
             'change': change,
             'change_percent': change_percent,
-            'volume': int(vol),
-            'market_cap': market_cap,
-            'pe_ratio': pe_ratio,
+            'volume': vol,
+            'market_cap': 0,  # not available on free TD time_series
+            'pe_ratio': 0,    # not available on free TD time_series
             'week_52_high': week_52_high,
             'week_52_low': week_52_low,
             'historical_data': hist_tail[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].to_dict('records')
@@ -358,7 +298,7 @@ def search_stock(symbol):
 
 @app.route('/api/recommendations', methods=['POST'])
 def get_recommendations():
-    """Get stock recommendations based on user profile without using .info"""
+    """Get stock recommendations based on user profile using Twelve Data history."""
     try:
         user_profile = request.json or {}
         budget = user_profile.get('budget', 100000)
@@ -373,16 +313,15 @@ def get_recommendations():
 
         for sym in stocks_to_analyze:
             try:
-                ticker = get_indian_stock_ticker(sym, 'NSE')
-                finfo, hist = fetch_stock_data(ticker)
+                sym = normalize_symbol(sym)
+                hist = td_fetch_series(sym, "NSE")
                 if hist is None or hist.empty:
-                    ticker = get_indian_stock_ticker(sym, 'BSE')
-                    finfo, hist = fetch_stock_data(ticker)
+                    hist = td_fetch_series(sym, "BSE")
                     if hist is None or hist.empty:
                         continue
 
                 hist = calculate_technical_indicators(hist)
-                current_price = safe_float(finfo.get('last_price'), safe_float(hist['Close'].iloc[-1], 0.0))
+                current_price = safe_float(hist['Close'].iloc[-1], 0.0)
 
                 if current_price <= 0 or current_price > budget:
                     continue
@@ -395,7 +334,7 @@ def get_recommendations():
                         'name': sym,
                         'current_price': current_price,
                         'recommendation': recommendation,
-                        'shares_affordable': int(budget / current_price)
+                        'shares_affordable': int(budget / current_price) if current_price > 0 else 0
                     })
             except Exception as inner_e:
                 app.logger.warning("Screening %s failed: %s", sym, inner_e)
@@ -430,27 +369,6 @@ def get_news(symbol):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Debug endpoint to see what Yahoo returns from Render
-@app.route('/api/debug/chart/<symbol>')
-def debug_chart(symbol):
-    sym = (symbol or "").upper().strip()
-    ticker = get_indian_stock_ticker(sym, 'NSE')
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=6mo&interval=1d"
-    try:
-        r = session.get(url, headers={"Referer": f"https://finance.yahoo.com/quote/{ticker}"}, timeout=12)
-        snippet = r.text[:200].replace("\n", " ")
-        ct = r.headers.get("content-type", "")
-        return jsonify({
-            "ticker": ticker,
-            "status": r.status_code,
-            "content_type": ct,
-            "is_json": "json" in ct.lower(),
-            "snippet": snippet
-        })
-    except Exception as e:
-        return jsonify({"error": str(e), "ticker": ticker}), 500
-
 if __name__ == '__main__':
-    # Render provides PORT; bind to 0.0.0.0
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
