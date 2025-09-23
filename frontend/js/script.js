@@ -5,6 +5,85 @@ let userProfile = {
   timeline: 'medium'
 };
 
+// Typeahead helpers
+let suggestTimer = null;
+let activeIndex = -1;
+let lastSuggestions = [];
+
+function debounce(fn, delay = 200) {
+  return (...args) => {
+    clearTimeout(suggestTimer);
+    suggestTimer = setTimeout(() => fn(...args), delay);
+  };
+}
+
+function renderSuggestions(items) {
+  const box = document.getElementById('suggestions');
+  lastSuggestions = items || [];
+  activeIndex = -1;
+
+  if (!items || items.length === 0) {
+    box.innerHTML = '';
+    box.classList.add('hidden');
+    return;
+  }
+
+  box.innerHTML = items.map((s, i) => `
+    <div class="suggestion-item" data-idx="${i}">
+      <div class="suggestion-left">${s.symbol} <span style="color:#888; font-weight:400;">${s.exchange}</span></div>
+      <div class="suggestion-right">${s.name ? s.name : ''}</div>
+    </div>
+  `).join('');
+  box.classList.remove('hidden');
+
+  // click handlers
+  box.querySelectorAll('.suggestion-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const idx = Number(el.getAttribute('data-idx'));
+      pickSuggestion(idx);
+    });
+  });
+}
+
+async function fetchSuggestions(q) {
+  if (!q || q.length < 2) {
+    renderSuggestions([]);
+    return;
+  }
+  try {
+    const res = await fetch(`/api/suggest?q=${encodeURIComponent(q)}`);
+    const data = await res.json();
+    renderSuggestions(Array.isArray(data) ? data : []);
+  } catch (e) {
+    console.warn('suggest error', e);
+    renderSuggestions([]);
+  }
+}
+
+function pickSuggestion(idx) {
+  if (idx < 0 || idx >= lastSuggestions.length) return;
+  const s = lastSuggestions[idx];
+  const input = document.getElementById('stockSearch');
+  input.value = s.symbol; // keep it simple (symbol without suffix)
+  renderSuggestions([]);
+  searchStock(); // trigger your existing search
+}
+
+function navigateSuggestions(direction) {
+  const box = document.getElementById('suggestions');
+  const items = Array.from(box.querySelectorAll('.suggestion-item'));
+  if (items.length === 0) return;
+
+  items.forEach(el => el.classList.remove('active'));
+  if (direction === 'down') {
+    activeIndex = (activeIndex + 1) % items.length;
+  } else if (direction === 'up') {
+    activeIndex = (activeIndex - 1 + items.length) % items.length;
+  }
+  items[activeIndex].classList.add('active');
+  items[activeIndex].scrollIntoView({ block: 'nearest' });
+}
+
 let currentChart = null;
 // Use relative API base so it works on Render (and when served by Flask)
 const API_BASE_URL = '/api';
