@@ -54,6 +54,69 @@ def favicon():
         return send_from_directory(app.static_folder, "favicon.ico")
     return ("", 204)
 
+from urllib.parse import quote_plus
+
+@app.route('/api/suggest')
+def api_suggest():
+    # Require proxy URL to be configured
+    if not YAHOO_PROXY_URL:
+        return jsonify([])
+
+    q = (request.args.get('q') or '').strip()
+    if len(q) < 2:
+        return jsonify([])
+
+    try:
+        url = f"{YAHOO_PROXY_URL}/search?q={quote_plus(q)}"
+        r = session.get(url, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        quotes = j.get('quotes', []) or []
+
+        suggestions = []
+        for it in quotes:
+            sym = (it.get('symbol') or '').upper()
+            if not sym:
+                continue
+            # Filter to India eq symbols only (suffix NS/BO or exchange display)
+            if sym.endswith('.NS'):
+                exchange = 'NSE'
+                base = sym[:-3]
+            elif sym.endswith('.BO'):
+                exchange = 'BSE'
+                base = sym[:-3]
+            else:
+                # Sometimes search returns NSI/BSE in fields; keep if display says NSE/BSE
+                exch_disp = (it.get('exchDisp') or it.get('exchange') or '').upper()
+                if exch_disp not in ('NSE', 'BSE'):
+                    continue
+                # If no suffix in symbol, skip (we need chart suffix later)
+                continue
+
+            name = it.get('shortname') or it.get('longname') or it.get('name') or base
+            suggestions.append({
+                'symbol': base,            # e.g., TCS
+                'fullSymbol': sym,         # e.g., TCS.NS
+                'exchange': exchange,      # 'NSE' or 'BSE'
+                'name': name               # company name
+            })
+
+        # Unique by (symbol, exchange)
+        seen = set()
+        dedup = []
+        for s in suggestions:
+            key = (s['symbol'], s['exchange'])
+            if key in seen: 
+                continue
+            seen.add(key)
+            dedup.append(s)
+
+        return jsonify(dedup[:10])
+
+    except Exception as e:
+        app.logger.warning("api_suggest failed: %s", e)
+        return jsonify([])
+
 # Health
 @app.route("/api/health")
 def health():
