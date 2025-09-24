@@ -1,22 +1,35 @@
-// Global variables
+// ---------------------- Global state ----------------------
 let userProfile = {
   budget: 100000,
   risk_tolerance: 'medium',
   timeline: 'medium'
 };
 
-// Typeahead helpers
+let currentChart = null;
+let refreshInterval = null;
+
+const API_BASE_URL = '/api';
+
+// ---------------------- Typeahead state ----------------------
 let suggestTimer = null;
 let activeIndex = -1;
 let lastSuggestions = [];
 
-function debounce(fn, delay = 200) {
+// ---------------------- Utils ----------------------
+function debounce(fn, delay = 250) {
   return (...args) => {
     clearTimeout(suggestTimer);
     suggestTimer = setTimeout(() => fn(...args), delay);
   };
 }
 
+function formatNumber(num) {
+  if (num >= 10000000) return `₹${(num / 10000000).toFixed(2)} Cr`;
+  if (num >= 100000) return `₹${(num / 100000).toFixed(2)} L`;
+  return `₹${Number(num).toLocaleString('en-IN')}`;
+}
+
+// ---------------------- Typeahead: render/fetch/pick/navigate ----------------------
 function renderSuggestions(items) {
   const box = document.getElementById('suggestions');
   lastSuggestions = items || [];
@@ -36,7 +49,7 @@ function renderSuggestions(items) {
   `).join('');
   box.classList.remove('hidden');
 
-  // click handlers
+  // Click to pick
   box.querySelectorAll('.suggestion-item').forEach(el => {
     el.addEventListener('click', () => {
       const idx = Number(el.getAttribute('data-idx'));
@@ -64,9 +77,9 @@ function pickSuggestion(idx) {
   if (idx < 0 || idx >= lastSuggestions.length) return;
   const s = lastSuggestions[idx];
   const input = document.getElementById('stockSearch');
-  input.value = s.symbol; // keep it simple (symbol without suffix)
+  input.value = s.symbol; // keep base symbol (e.g., TCS)
   renderSuggestions([]);
-  searchStock(); // trigger your existing search
+  searchStock();
 }
 
 function navigateSuggestions(direction) {
@@ -84,58 +97,118 @@ function navigateSuggestions(direction) {
   items[activeIndex].scrollIntoView({ block: 'nearest' });
 }
 
-let currentChart = null;
-// Use relative API base so it works on Render (and when served by Flask)
-const API_BASE_URL = '/api';
-
-// Initialize
-document.addEventListener('DOMContentLoaded', function () {
+// ---------------------- Init ----------------------
+document.addEventListener('DOMContentLoaded', () => {
   loadUserProfile();
+  updateProfileDisplay();
   setupEventListeners();
 });
 
-// Setup event listeners
+// ---------------------- Event wiring ----------------------
 function setupEventListeners() {
-  document.getElementById('searchBtn').addEventListener('click', searchStock);
-  document.getElementById('stockSearch').addEventListener('keypress', function (e) {
-    if (e.key === 'Enter') searchStock();
+  const searchBtn = document.getElementById('searchBtn');
+  const input = document.getElementById('stockSearch');
+  const suggestionsBox = document.getElementById('suggestions');
+  const modal = document.getElementById('profileModal');
+
+  // Search button
+  searchBtn.addEventListener('click', () => {
+    renderSuggestions([]);
+    searchStock();
   });
 
+  // Input: typeahead + keys
+  input.addEventListener('input', debounce((e) => {
+    const q = e.target.value.trim();
+    fetchSuggestions(q);
+  }, 250));
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (activeIndex >= 0) {
+        pickSuggestion(activeIndex);
+      } else {
+        renderSuggestions([]);
+        searchStock();
+      }
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      navigateSuggestions('down');
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      navigateSuggestions('up');
+    } else if (e.key === 'Escape') {
+      renderSuggestions([]);
+    }
+  });
+
+  // Close suggestions on outside click
+  document.addEventListener('click', (e) => {
+    if (!suggestionsBox.contains(e.target) && e.target !== input) {
+      renderSuggestions([]);
+    }
+  });
+
+  // Profile modal
   document.getElementById('profileBtn').addEventListener('click', openProfileModal);
   document.getElementById('profileForm').addEventListener('submit', saveProfile);
   document.querySelector('.close').addEventListener('click', closeProfileModal);
 
-  document.getElementById('getRecommendations').addEventListener('click', getRecommendations);
-
-  // Close modal when clicking outside
+  // Close modal on outside click
   window.addEventListener('click', function (e) {
-    const modal = document.getElementById('profileModal');
     if (e.target === modal) {
       closeProfileModal();
     }
   });
+
+  // Recommendations
+  document.getElementById('getRecommendations').addEventListener('click', getRecommendations);
 }
 
-// Load user profile from localStorage
+// ---------------------- Profile ----------------------
 function loadUserProfile() {
   const saved = localStorage.getItem('userProfile');
   if (saved) {
     userProfile = JSON.parse(saved);
-    updateProfileDisplay();
   }
 }
 
-// Update profile display
 function updateProfileDisplay() {
   document.getElementById('userBudget').textContent = `Budget: ₹${userProfile.budget.toLocaleString('en-IN')}`;
-  document.getElementById('budget').value = userProfile.budget;
-  document.getElementById('riskTolerance').value = userProfile.risk_tolerance;
-  document.getElementById('timeline').value = userProfile.timeline;
+  const budgetEl = document.getElementById('budget');
+  const riskEl = document.getElementById('riskTolerance');
+  const timelineEl = document.getElementById('timeline');
+  if (budgetEl) budgetEl.value = userProfile.budget;
+  if (riskEl) riskEl.value = userProfile.risk_tolerance;
+  if (timelineEl) timelineEl.value = userProfile.timeline;
 }
 
-// Search stock
+function openProfileModal() {
+  document.getElementById('profileModal').style.display = 'block';
+}
+
+function closeProfileModal() {
+  document.getElementById('profileModal').style.display = 'none';
+}
+
+function saveProfile(e) {
+  e.preventDefault();
+  userProfile = {
+    budget: parseInt(document.getElementById('budget').value, 10),
+    risk_tolerance: document.getElementById('riskTolerance').value,
+    timeline: document.getElementById('timeline').value
+  };
+  localStorage.setItem('userProfile', JSON.stringify(userProfile));
+  updateProfileDisplay();
+  closeProfileModal();
+  document.getElementById('recommendationsContainer').innerHTML = '';
+}
+
+// ---------------------- Search flow ----------------------
 async function searchStock() {
-  const symbol = document.getElementById('stockSearch').value.trim().toUpperCase();
+  const input = document.getElementById('stockSearch');
+  const symbol = input.value.trim().toUpperCase();
   if (!symbol) return;
 
   const searchBtn = document.getElementById('searchBtn');
@@ -163,63 +236,61 @@ async function searchStock() {
   }
 }
 
-// Display stock information
 function displayStockInfo(data) {
   document.getElementById('stockName').textContent = data.name || data.symbol || '-';
-  document.getElementById('currentPrice').textContent = isFinite(data.current_price) ? `₹${data.current_price.toFixed(2)}` : '-';
+  document.getElementById('currentPrice').textContent =
+    Number.isFinite(data.current_price) ? `₹${Number(data.current_price).toFixed(2)}` : '-';
 
   const changeElement = document.getElementById('priceChange');
   const changeVal = Number(data.change);
   const changePct = Number(data.change_percent);
   const changeText =
-    `${isFinite(changeVal) && changeVal >= 0 ? '+' : ''}${isFinite(changeVal) ? changeVal.toFixed(2) : '-'} ` +
-    `(${isFinite(changePct) && changePct >= 0 ? '+' : ''}${isFinite(changePct) ? changePct.toFixed(2) : '-'}%)`;
+    `${Number.isFinite(changeVal) && changeVal >= 0 ? '+' : ''}${Number.isFinite(changeVal) ? changeVal.toFixed(2) : '-'}` +
+    ` (${Number.isFinite(changePct) && changePct >= 0 ? '+' : ''}${Number.isFinite(changePct) ? changePct.toFixed(2) : '-'}%)`;
   changeElement.textContent = changeText;
-  changeElement.className = isFinite(changeVal) && changeVal >= 0 ? 'price-change positive' : 'price-change negative';
+  changeElement.className = Number.isFinite(changeVal) && changeVal >= 0 ? 'price-change positive' : 'price-change negative';
 
-  document.getElementById('volume').textContent = Number.isFinite(data.volume) ? data.volume.toLocaleString('en-IN') : '-';
+  document.getElementById('volume').textContent =
+    Number.isFinite(data.volume) ? Number(data.volume).toLocaleString('en-IN') : '-';
 
   const mcap = Number(data.market_cap);
-  document.getElementById('marketCap').textContent = mcap ? `₹${(mcap / 10000000).toFixed(2)} Cr` : '-';
+  document.getElementById('marketCap').textContent = mcap ? formatNumber(mcap) : '-';
 
   const pe = Number(data.pe_ratio);
-  document.getElementById('peRatio').textContent = isFinite(pe) && pe > 0 ? pe.toFixed(2) : '-';
+  document.getElementById('peRatio').textContent = Number.isFinite(pe) && pe > 0 ? pe.toFixed(2) : '-';
 
   const low52 = Number(data.week_52_low);
   const high52 = Number(data.week_52_high);
   document.getElementById('weekRange').textContent =
-    isFinite(low52) && isFinite(high52) ? `₹${low52.toFixed(2)} - ₹${high52.toFixed(2)}` : '-';
+    Number.isFinite(low52) && Number.isFinite(high52) ? `₹${low52.toFixed(2)} - ₹${high52.toFixed(2)}` : '-';
 
-  // Draw chart
   drawPriceChart(data.historical_data || []);
 }
 
-// Draw price chart
+// ---------------------- Chart ----------------------
 function drawPriceChart(historicalData) {
-  const ctx = document.getElementById('priceChart').getContext('2d');
+  const canvas = document.getElementById('priceChart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
 
-  // Destroy existing chart if any
   if (currentChart) {
     currentChart.destroy();
   }
 
-  // Defensive: ensure Chart.js is loaded
   if (typeof Chart === 'undefined') {
     console.error('Chart.js is not loaded. Please include it in index.html');
     return;
   }
 
-  // Build labels from Date if provided; otherwise, fallback to generated dates
   const n = historicalData.length;
   const labels = historicalData.map((d, idx) => {
     const ds = d.Date || d.date || d.datetime || d.Datetime;
     if (ds) {
       const dt = new Date(ds);
       return isNaN(dt.getTime())
-        ? '' + (idx + 1)
+        ? String(idx + 1)
         : dt.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' });
     } else {
-      // Fallback: approximate sequential dates ending today
       const dt = new Date();
       dt.setDate(dt.getDate() - (n - 1 - idx));
       return dt.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' });
@@ -231,19 +302,17 @@ function drawPriceChart(historicalData) {
   currentChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: labels,
-      datasets: [
-        {
-          label: 'Price',
-          data: prices,
-          borderColor: '#1a73e8',
-          backgroundColor: 'rgba(26, 115, 232, 0.1)',
-          borderWidth: 2,
-          pointRadius: 0,
-          pointHoverRadius: 4,
-          tension: 0.1
-        }
-      ]
+      labels,
+      datasets: [{
+        label: 'Price',
+        data: prices,
+        borderColor: '#1a73e8',
+        backgroundColor: 'rgba(26, 115, 232, 0.1)',
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        tension: 0.1
+      }]
     },
     options: {
       responsive: true,
@@ -254,8 +323,8 @@ function drawPriceChart(historicalData) {
           mode: 'index',
           intersect: false,
           callbacks: {
-            label: function (context) {
-              const y = context.parsed.y;
+            label: (ctx) => {
+              const y = ctx.parsed.y;
               return Number.isFinite(y) ? `₹${y.toFixed(2)}` : '—';
             }
           }
@@ -265,23 +334,15 @@ function drawPriceChart(historicalData) {
         x: { grid: { display: false } },
         y: {
           grid: { color: 'rgba(0, 0, 0, 0.05)' },
-          ticks: {
-            callback: function (value) {
-              return '₹' + Number(value).toFixed(0);
-            }
-          }
+          ticks: { callback: (v) => '₹' + Number(v).toFixed(0) }
         }
       },
-      interaction: {
-        mode: 'nearest',
-        axis: 'x',
-        intersect: false
-      }
+      interaction: { mode: 'nearest', axis: 'x', intersect: false }
     }
   });
 }
 
-// Load news
+// ---------------------- News ----------------------
 async function loadNews(symbol) {
   try {
     const response = await fetch(`${API_BASE_URL}/news/${encodeURIComponent(symbol)}`);
@@ -313,7 +374,7 @@ async function loadNews(symbol) {
   }
 }
 
-// Get recommendations
+// ---------------------- Recommendations ----------------------
 async function getRecommendations() {
   const btn = document.getElementById('getRecommendations');
   btn.innerHTML = '<span class="loading"></span> Loading...';
@@ -325,7 +386,6 @@ async function getRecommendations() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(userProfile)
     });
-
     const recommendations = await response.json();
     if (!response.ok) {
       throw new Error(recommendations?.error || 'Failed to load recommendations');
@@ -340,7 +400,6 @@ async function getRecommendations() {
   }
 }
 
-// Display recommendations
 function displayRecommendations(recommendations) {
   const container = document.getElementById('recommendationsContainer');
   container.innerHTML = '';
@@ -376,60 +435,14 @@ function displayRecommendations(recommendations) {
         </ul>
       </div>
     `;
-
     container.appendChild(card);
   });
 }
 
-// Profile modal functions
-function openProfileModal() {
-  document.getElementById('profileModal').style.display = 'block';
-}
-
-function closeProfileModal() {
-  document.getElementById('profileModal').style.display = 'none';
-}
-
-function saveProfile(e) {
-  e.preventDefault();
-
-  userProfile = {
-    budget: parseInt(document.getElementById('budget').value, 10),
-    risk_tolerance: document.getElementById('riskTolerance').value,
-    timeline: document.getElementById('timeline').value
-  };
-
-  localStorage.setItem('userProfile', JSON.stringify(userProfile));
-  updateProfileDisplay();
-  closeProfileModal();
-
-  // Clear recommendations to force refresh with new profile
-  document.getElementById('recommendationsContainer').innerHTML = '';
-}
-
-// Utility function to format large numbers
-function formatNumber(num) {
-  if (num >= 10000000) {
-    return `₹${(num / 10000000).toFixed(2)} Cr`;
-  } else if (num >= 100000) {
-    return `₹${(num / 100000).toFixed(2)} L`;
-  } else {
-    return `₹${Number(num).toLocaleString('en-IN')}`;
-  }
-}
-
-// Auto-refresh functionality (optional)
-let refreshInterval;
-
+// ---------------------- Auto refresh ----------------------
 function startAutoRefresh(symbol) {
-  // Clear existing interval
-  if (refreshInterval) {
-    clearInterval(refreshInterval);
-  }
-
-  // Refresh every 30 seconds
+  if (refreshInterval) clearInterval(refreshInterval);
   refreshInterval = setInterval(() => {
-    // Keep the same symbol in the input for refresh
     const input = document.getElementById('stockSearch');
     if (symbol) input.value = symbol;
     searchStock();
@@ -437,19 +450,14 @@ function startAutoRefresh(symbol) {
 }
 
 function stopAutoRefresh() {
-  if (refreshInterval) {
-    clearInterval(refreshInterval);
-  }
+  if (refreshInterval) clearInterval(refreshInterval);
 }
 
-// Add real-time updates indicator (optional visual cue)
+// Optional: quick visual cue
 function showUpdateIndicator() {
   const indicator = document.createElement('div');
   indicator.className = 'update-indicator';
   indicator.innerHTML = 'Updating...';
   document.body.appendChild(indicator);
-
-  setTimeout(() => {
-    indicator.remove();
-  }, 1000);
+  setTimeout(() => indicator.remove(), 1000);
 }
