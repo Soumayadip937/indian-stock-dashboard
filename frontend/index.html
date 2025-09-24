@@ -15,19 +15,17 @@
             <div class="user-info">
                 <span id="userBudget">Budget: ₹0</span>
                 <button id="profileBtn" class="btn-secondary">Profile Settings</button>
-            </div>
-            <div class="typeahead">
-  <input id="stockSearch" type="text" placeholder="Search by name or symbol (e.g., TCS, Reliance)" />
-  <div id="suggestions" class="suggestions hidden"></div>
-</div>
         </header>
 
         <!-- Search Section -->
-        <section class="search-section">
+        <section class="search-section"> 
             <div class="search-container">
-                <input type="text" id="stockSearch" placeholder="Enter stock symbol (e.g., RELIANCE, TCS)" class="search-input">
+                <div class="typeahead"> 
+                    <input type="text" id="stockSearch" placeholder="Search by name or symbol (e.g., TCS, Reliance)" class="search-input" autocomplete="off" /> 
+                    <div id="suggestions" class="suggestions hidden"></div> 
+                </div> 
                 <button id="searchBtn" class="btn-primary">Search</button>
-            </div>
+            </div> 
         </section>
 
         <!-- Main Content -->
